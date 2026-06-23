@@ -1,0 +1,310 @@
+import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+
+
+# ============================================================
+# 1. Create triangular mesh on S^2 by subdividing an icosahedron
+# ============================================================
+
+def normalize_rows(V):
+    return V / np.linalg.norm(V, axis=1)[:, None]
+
+
+def create_icosphere(subdivisions=3, radius=1.0):
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+
+    V = np.array([
+        [-1,  phi, 0],
+        [ 1,  phi, 0],
+        [-1, -phi, 0],
+        [ 1, -phi, 0],
+
+        [0, -1,  phi],
+        [0,  1,  phi],
+        [0, -1, -phi],
+        [0,  1, -phi],
+
+        [ phi, 0, -1],
+        [ phi, 0,  1],
+        [-phi, 0, -1],
+        [-phi, 0,  1],
+    ], dtype=float)
+
+    V = radius * normalize_rows(V)
+
+    F = np.array([
+        [0, 11, 5],
+        [0, 5, 1],
+        [0, 1, 7],
+        [0, 7, 10],
+        [0, 10, 11],
+
+        [1, 5, 9],
+        [5, 11, 4],
+        [11, 10, 2],
+        [10, 7, 6],
+        [7, 1, 8],
+
+        [3, 9, 4],
+        [3, 4, 2],
+        [3, 2, 6],
+        [3, 6, 8],
+        [3, 8, 9],
+
+        [4, 9, 5],
+        [2, 4, 11],
+        [6, 2, 10],
+        [8, 6, 7],
+        [9, 8, 1],
+    ], dtype=int)
+
+    V = V.tolist()
+    F = F.tolist()
+
+    def midpoint(i, j, vertex_list, midpoint_cache):
+        key = tuple(sorted((i, j)))
+        if key in midpoint_cache:
+            return midpoint_cache[key]
+
+        p = 0.5 * (np.array(vertex_list[i]) + np.array(vertex_list[j]))
+        p = radius * p / np.linalg.norm(p)
+
+        vertex_list.append(p.tolist())
+        idx = len(vertex_list) - 1
+        midpoint_cache[key] = idx
+        return idx
+
+    for _ in range(subdivisions):
+        new_F = []
+        midpoint_cache = {}
+
+        for i, j, k in F:
+            a = midpoint(i, j, V, midpoint_cache)
+            b = midpoint(j, k, V, midpoint_cache)
+            c = midpoint(k, i, V, midpoint_cache)
+
+            new_F.extend([
+                [i, a, c],
+                [a, j, b],
+                [c, b, k],
+                [a, b, c],
+            ])
+
+        F = new_F
+
+    return np.array(V, dtype=float), np.array(F, dtype=int)
+
+
+# ============================================================
+# 2. Assemble FEM stiffness matrix C and consistent mass matrix M
+# ============================================================
+
+def cotangent(u, v):
+    cross_norm = np.linalg.norm(np.cross(u, v))
+    if cross_norm < 1e-15:
+        return 0.0
+    return np.dot(u, v) / cross_norm
+
+
+def assemble_fem_matrices(V, F):
+    n = V.shape[0]
+
+    I = []
+    J = []
+    C_data = []
+    M_data = []
+
+    for tri in F:
+        i, j, k = tri
+        p0, p1, p2 = V[i], V[j], V[k]
+
+        area = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0))
+        if area < 1e-15:
+            continue
+
+        # cotangents of angles at p0, p1, p2
+        cot0 = cotangent(p1 - p0, p2 - p0)
+        cot1 = cotangent(p2 - p1, p0 - p1)
+        cot2 = cotangent(p0 - p2, p1 - p2)
+
+        # local stiffness matrix
+        C_loc = 0.5 * np.array([
+            [cot1 + cot2, -cot2,       -cot1      ],
+            [-cot2,       cot2 + cot0, -cot0      ],
+            [-cot1,       -cot0,       cot0 + cot1],
+        ])
+
+        # local consistent mass matrix
+        M_loc = (area / 12.0) * np.array([
+            [2.0, 1.0, 1.0],
+            [1.0, 2.0, 1.0],
+            [1.0, 1.0, 2.0],
+        ])
+
+        idx = [i, j, k]
+        for a in range(3):
+            for b in range(3):
+                I.append(idx[a])
+                J.append(idx[b])
+                C_data.append(C_loc[a, b])
+                M_data.append(M_loc[a, b])
+
+    C = sp.coo_matrix((C_data, (I, J)), shape=(n, n)).tocsr()
+    M = sp.coo_matrix((M_data, (I, J)), shape=(n, n)).tocsr()
+
+    return C, M
+
+
+# ============================================================
+# 3. Solve generalized eigenvalue problem
+# ============================================================
+
+def solve_lbo_spectrum(C, M, k=20):
+    eigvals, eigvecs = spla.eigsh(
+        C,
+        k=k,
+        M=M,
+        which="SM",
+        tol=1e-10,
+        maxiter=5000
+    )
+
+    idx = np.argsort(eigvals)
+    eigvals = eigvals[idx]
+    eigvecs = eigvecs[:, idx]
+
+    eigvals[np.abs(eigvals) < 1e-12] = 0.0
+    return eigvals, eigvecs
+
+
+def exact_sphere_eigenvalues(k):
+    vals = []
+    ell = 0
+    while len(vals) < k:
+        vals.extend([ell * (ell + 1)] * (2 * ell + 1))
+        ell += 1
+    return np.array(vals[:k], dtype=float)
+
+
+# ============================================================
+# 4. Visualization
+# ============================================================
+
+def set_axes_equal(ax):
+    """
+    Make 3D axes have equal scale.
+    """
+    x_limits = ax.get_xlim3d()
+    y_limits = ax.get_ylim3d()
+    z_limits = ax.get_zlim3d()
+
+    x_range = abs(x_limits[1] - x_limits[0])
+    y_range = abs(y_limits[1] - y_limits[0])
+    z_range = abs(z_limits[1] - z_limits[0])
+
+    x_middle = np.mean(x_limits)
+    y_middle = np.mean(y_limits)
+    z_middle = np.mean(z_limits)
+
+    plot_radius = 0.5 * max([x_range, y_range, z_range])
+
+    ax.set_xlim3d([x_middle - plot_radius, x_middle + plot_radius])
+    ax.set_ylim3d([y_middle - plot_radius, y_middle + plot_radius])
+    ax.set_zlim3d([z_middle - plot_radius, z_middle + plot_radius])
+
+
+def plot_mesh(V, F):
+    fig = plt.figure(figsize=(8, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    ax.plot_trisurf(
+        V[:, 0], V[:, 1], V[:, 2],
+        triangles=F,
+        edgecolor='k',
+        linewidth=0.35,
+        color='lightblue',
+        alpha=0.95,
+        shade=False
+    )
+
+    ax.set_title("Triangular mesh approximation of $S^2$")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    set_axes_equal(ax)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_eigenfunction(V, F, u, title="Eigenfunction on mesh"):
+    fig = plt.figure(figsize=(8, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    surf = ax.plot_trisurf(
+        V[:, 0], V[:, 1], V[:, 2],
+        triangles=F,
+        cmap='coolwarm',
+        linewidth=0.2,
+        edgecolor='k',
+        shade=False,
+        antialiased=True
+    )
+
+    # color by vertex values
+    surf.set_array(u)
+    surf.autoscale()
+
+    ax.set_title(title)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    set_axes_equal(ax)
+    fig.colorbar(surf, ax=ax, shrink=0.7)
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# 5. Main
+# ============================================================
+
+if __name__ == "__main__":
+    subdivisions = 5   # increase to 4 if you want finer mesh
+    k = 30            # number of eigenvalues
+
+    # Create mesh
+    V, F = create_icosphere(subdivisions=subdivisions, radius=1.0)
+
+    print("Number of vertices :", V.shape[0])
+    print("Number of triangles:", F.shape[0])
+
+    # Assemble FEM matrices
+    C, M = assemble_fem_matrices(V, F)
+
+    # Solve spectral problem
+    eigvals, eigvecs = solve_lbo_spectrum(C, M, k=k)
+    exact_vals = exact_sphere_eigenvalues(k)
+
+    print("\n index | FEM eigenvalue | exact eigenvalue | error")
+    print("---------------------------------------------------")
+    for r in range(k):
+        print(
+            f"{r:5d} | "
+            f"{eigvals[r]:14.8f} | "
+            f"{exact_vals[r]:16.8f} | "
+            f"{abs(eigvals[r] - exact_vals[r]):.3e}"
+        )
+
+    # Show mesh
+    plot_mesh(V, F)
+
+    # Optional: show one eigenfunction
+    # index 0 is constant eigenfunction (lambda = 0)
+    # indices 1,2,3 correspond approximately to lambda = 2
+    plot_eigenfunction(
+        V, F, eigvecs[:, 1],
+        title=f"Eigenfunction for λ ≈ {eigvals[1]:.6f}"
+    )
